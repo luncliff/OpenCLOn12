@@ -45,11 +45,12 @@ FetchContent_MakeAvailable(wil)
 add_library(d3d12translationlayer STATIC ${TRANS_SRC} ${TRANS_INC} ${TRANS_INL})
 target_include_directories(d3d12translationlayer
     PUBLIC include/d3d12translationlayer
+    PRIVATE ${DirectX-Headers_SOURCE_DIR}/include/directx
     PRIVATE external)
 
 target_link_libraries(d3d12translationlayer Microsoft::DirectX-Headers d3d12 dxgi atls dxcore)
 
-target_compile_definitions(d3d12translationlayer PRIVATE $<$<CONFIG:DEBUG>:DBG>)
+target_compile_definitions(d3d12translationlayer PRIVATE $<$<CONFIG:DEBUG>:DBG> SUPPORTS_DXBC_PARSE)
 target_compile_definitions(d3d12translationlayer PUBLIC $<$<CONFIG:DEBUG>:TRANSLATION_LAYER_DBG=1>)
 
 add_library(openclon12 SHARED ${MAIN_SRC} ${MAIN_INC} ${EXTERNAL_INC})
