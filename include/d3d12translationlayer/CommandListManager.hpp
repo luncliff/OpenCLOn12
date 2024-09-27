@@ -2,31 +2,41 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
-#include "Fence.hpp"
-#include "Util.hpp"
-
 namespace D3D12TranslationLayer
 {
     LONGLONG InterlockedRead64(volatile LONGLONG* p);
 
     class ImmediateContext;
-    class ResidencySet;
 
     class CommandListManager
     {
     public:
-        CommandListManager(ImmediateContext *pParent, ID3D12CommandQueue *pQueue);
+        CommandListManager(ImmediateContext *pParent, ID3D12CommandQueue *pQueue, COMMAND_LIST_TYPE type);
 
         ~CommandListManager();
 
         void AdditionalCommandsAdded() noexcept;
+        void DrawCommandAdded() noexcept;
         void DispatchCommandAdded() noexcept;
         void UploadHeapSpaceAllocated(UINT64 heapSize) noexcept;
         void ReadbackInitiated() noexcept;
         void SubmitCommandListIfNeeded();
 
+        void SetNeedSubmitFence() noexcept { m_bNeedSubmitFence = true; }
         bool HasCommands() const noexcept { return m_NumCommands > 0; }
+        bool NeedSubmitFence() const noexcept { return m_bNeedSubmitFence; }
+        bool ShouldFlushForResourceAcquire() const noexcept { return HasCommands() || NeedSubmitFence(); }
+        template <typename TFunc> void ExecuteCommandQueueCommand(TFunc&& func)
+        {
+            m_bNeedSubmitFence = true;
+            m_pResidencySet->Close();
+            m_pParent->GetResidencyManager().SubmitCommandQueueCommand(
+                m_pCommandQueue.get(), (UINT)m_type, m_pResidencySet.get(), std::forward<TFunc>(func));
+            ResetResidencySet();
+        }
+
+        HRESULT PreExecuteCommandQueueCommand(); //throws
+        HRESULT PostExecuteCommandQueueCommand(); //throws
 
         void SubmitCommandList();
         void InitCommandList();
@@ -48,19 +58,24 @@ namespace D3D12TranslationLayer
 
         UINT64 GetCommandListID() { return m_commandListID; }
         UINT64 GetCommandListIDInterlockedRead() { return InterlockedRead64((volatile LONGLONG*)&m_commandListID); }
+        _Out_range_(0, COMMAND_LIST_TYPE::MAX_VALID - 1) COMMAND_LIST_TYPE GetCommandListType() { return m_type; }
         ID3D12CommandQueue* GetCommandQueue() { return m_pCommandQueue.get(); }
         ID3D12CommandList* GetCommandList() { return m_pCommandList.get(); }
         ID3D12SharingContract* GetSharingContract() { return m_pSharingContract.get(); }
         Fence* GetFence() { return &m_Fence; }
 
-        ID3D12GraphicsCommandList* GetGraphicsCommandList(ID3D12CommandList *pCommandList = nullptr) { return static_cast<ID3D12GraphicsCommandList * const>(pCommandList ? pCommandList : m_pCommandList.get()); }
+        ID3D12VideoDecodeCommandList2* GetVideoDecodeCommandList(ID3D12CommandList *pCommandList = nullptr) { return  m_type == COMMAND_LIST_TYPE::VIDEO_DECODE ? static_cast<ID3D12VideoDecodeCommandList2 * const>(pCommandList ? pCommandList : m_pCommandList.get()) : nullptr;  }
+        ID3D12VideoProcessCommandList2* GetVideoProcessCommandList(ID3D12CommandList *pCommandList = nullptr) { return  m_type == COMMAND_LIST_TYPE::VIDEO_PROCESS ? static_cast<ID3D12VideoProcessCommandList2 * const>(pCommandList ? pCommandList : m_pCommandList.get()) : nullptr; }
+        ID3D12GraphicsCommandList* GetGraphicsCommandList(ID3D12CommandList *pCommandList = nullptr) { return  m_type == COMMAND_LIST_TYPE::GRAPHICS ? static_cast<ID3D12GraphicsCommandList * const>(pCommandList ? pCommandList : m_pCommandList.get()) : nullptr; }
 
         bool WaitForFenceValueInternal(bool IsImmediateContextThread, UINT64 FenceValue);
+        bool ComputeOnly() {return !!(m_pParent->FeatureLevel() == D3D_FEATURE_LEVEL_1_0_CORE);}
 
     private:
         void ResetCommandListTrackingData()
         {
             m_NumCommands = 0;
+            m_NumDraws = 0;
             m_NumDispatches = 0;
             m_UploadHeapSpaceAllocated = 0;
         }
@@ -68,6 +83,7 @@ namespace D3D12TranslationLayer
         void SubmitCommandListImpl();
 
         ImmediateContext* const                             m_pParent; // weak-ref
+        const COMMAND_LIST_TYPE                             m_type;
         unique_comptr<ID3D12CommandList>                    m_pCommandList;
         unique_comptr<ID3D12CommandAllocator>               m_pCommandAllocator;
         unique_comptr<ID3D12CommandQueue>                   m_pCommandQueue;
@@ -79,8 +95,10 @@ namespace D3D12TranslationLayer
         std::unique_ptr<ResidencySet>      m_pResidencySet;
         UINT                                                m_NumFlushesWithNoReadback = 0;
         UINT                                                m_NumCommands = 0;
+        UINT                                                m_NumDraws = 0;
         UINT                                                m_NumDispatches = 0;
         UINT64                                              m_UploadHeapSpaceAllocated = 0;
+        bool                                                m_bNeedSubmitFence;
         ThrowingSafeHandle                                  m_hWaitEvent;
 
         // The more upload heap space allocated in a command list, the more memory we are 
@@ -100,9 +118,15 @@ namespace D3D12TranslationLayer
         UINT64 m_commandListID = 1;
 
         // Number of maximum in-flight command lists at a given time
-        static constexpr UINT GetMaxInFlightDepth()
+        static constexpr UINT GetMaxInFlightDepth(COMMAND_LIST_TYPE type)
         {
-            return 1024;
+            switch (type)
+            {
+                case COMMAND_LIST_TYPE::VIDEO_DECODE:
+                    return 16;
+                default:
+                    return 1024;
+            }
         };
 
         void SubmitFence() noexcept;
@@ -110,6 +134,7 @@ namespace D3D12TranslationLayer
         void PrepareNewCommandList();
         void IncrementFence();
         void UpdateLastUsedCommandListIDs();
+        D3D12_COMMAND_LIST_TYPE GetD3D12CommandListType(COMMAND_LIST_TYPE type);
     };
 
 }  // namespace D3D12TranslationLayer

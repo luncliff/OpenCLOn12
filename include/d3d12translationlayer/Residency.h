@@ -2,10 +2,6 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
-#include "Util.hpp"
-#include <mutex>
-
 namespace D3D12TranslationLayer
 {
     // Used to contain waits that must be satisfied before a pinned ManagedObject can be unpinned.
@@ -102,12 +98,12 @@ namespace D3D12TranslationLayer
         // The size of the D3D Object in bytes
         UINT64 Size = 0;
 
-        UINT64 LastUsedFenceValue = 0;
+        UINT64 LastUsedFenceValues[(UINT)COMMAND_LIST_TYPE::MAX_VALID] = {};
         UINT64 LastUsedTimestamp = 0;
 
         // This is used to track which open command lists this resource is currently used on.
         // + 1 for transient residency sets.
-        bool CommandListsUsedOn[2] = {};
+        bool CommandListsUsedOn[(UINT)COMMAND_LIST_TYPE::MAX_VALID + 1] = {};
 
         // Linked list entry
         LIST_ENTRY ListEntry;
@@ -187,15 +183,15 @@ namespace D3D12TranslationLayer
 
             HRESULT GPUWait(ID3D12CommandQueue* pQueue, UINT CommandListIndex)
             {
-                if (CommandListIndex == 0)
+                if (CommandListIndex < (UINT)COMMAND_LIST_TYPE::MAX_VALID)
                 {
                     // Don't call Wait again if we've already inserted a wait on this queue
-                    assert(LastWaitedValue <= FenceValue);
-                    if (LastWaitedValue == FenceValue)
+                    assert(LastWaitedValues[CommandListIndex] <= FenceValue);
+                    if (LastWaitedValues[CommandListIndex] == FenceValue)
                     {
                         return S_OK;
                     }
-                    LastWaitedValue = FenceValue;
+                    LastWaitedValues[CommandListIndex] = FenceValue;
                 }
                 HRESULT hr = pQueue->Wait(pFence, FenceValue);
                 assert(SUCCEEDED(hr));
@@ -209,7 +205,7 @@ namespace D3D12TranslationLayer
 
             CComPtr<ID3D12Fence> pFence;
             UINT64 FenceValue = 0;
-            UINT64 LastWaitedValue = {};
+            UINT64 LastWaitedValues[(UINT)COMMAND_LIST_TYPE::MAX_VALID] = {};
         };
 
         // A Least Recently Used Cache. Tracks all of the objects requested by the app so that objects
@@ -290,10 +286,10 @@ namespace D3D12TranslationLayer
             }
 
             // Evict all of the resident objects used in sync points up to the specficied one (inclusive)
-            void TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 CurrentBudget, std::vector<ID3D12Pageable*> &EvictionList, UINT64 FenceValue);
+            void TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 CurrentBudget, std::vector<ID3D12Pageable*> &EvictionList, UINT64 FenceValues[]);
 
             // Trim all objects which are older than the specified time
-            void TrimAgedAllocations(UINT64 FenceValue, std::vector<ID3D12Pageable*> &EvictionList, UINT64 CurrentTimeStamp, UINT64 MinDelta);
+            void TrimAgedAllocations(UINT64 FenceValues[], std::vector<ID3D12Pageable*> &EvictionList, UINT64 CurrentTimeStamp, UINT64 MinDelta);
 
             ManagedObject* GetResidentListHead()
             {
@@ -321,7 +317,8 @@ namespace D3D12TranslationLayer
         {
         }
 
-        HRESULT Initialize(IDXCoreAdapter* ParentAdapterDXCore);
+        // NOTE: DeviceNodeIndex is an index not a mask. The majority of D3D12 uses bit masks to identify a GPU node whereas DXGI uses 0 based indices.
+        HRESULT Initialize(UINT DeviceNodeIndex, IDXCoreAdapter* ParentAdapterDXCore, IDXGIAdapter3* ParentAdapterDXGI);
 
         void BeginTrackingObject(ManagedObject* pObject)
         {
@@ -394,6 +391,8 @@ namespace D3D12TranslationLayer
 
         void GetCurrentBudget(UINT64 Timestamp, DXCoreAdapterMemoryBudget* InfoOut);
 
+        void WaitForSyncPoint(UINT64 FenceValues[]);
+
         // Generate a result between the minimum period and the maximum period based on the current
         // local memory pressure. I.e. when memory pressure is low, objects will persist longer before
         // being evicted.
@@ -422,7 +421,10 @@ namespace D3D12TranslationLayer
         Internal::Fence AsyncThreadFence;
 
         CComPtr<ID3D12Device3> Device;
+        // NOTE: This is an index not a mask. The majority of D3D12 uses bit masks to identify a GPU node whereas DXGI uses 0 based indices.
+        UINT NodeIndex = 0;
         IDXCoreAdapter* AdapterDXCore = nullptr;
+        IDXGIAdapter3* AdapterDXGI = nullptr;
         Internal::LRUCache LRU;
 
         std::mutex Mutex;

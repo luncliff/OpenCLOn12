@@ -2,10 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
 #include <memory>
-#include <set>
-#include <assert.h>
 
 //================================================================================================
 // Allocator classes must implement:

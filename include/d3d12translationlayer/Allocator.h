@@ -2,11 +2,6 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
-#include "BlockAllocators.h"
-#include "BlockAllocators.inl"
-#include "Util.hpp"
-
 namespace D3D12TranslationLayer 
 {
     class HeapSuballocationBlock : public BlockAllocators::CGenericBlock<UINT64>
@@ -73,8 +68,9 @@ namespace D3D12TranslationLayer
     {
     public:
         template <typename... InnerAllocatorArgs>
-        ThreadSafeBuddyHeapAllocator(UINT64 maxBlockSize, UINT64 threshold, InnerAllocatorArgs&&... innerArgs) : // throw(std::bad_alloc)
-            DisjointBuddyHeapAllocator(maxBlockSize, threshold, std::forward<InnerAllocatorArgs>(innerArgs)...)
+        ThreadSafeBuddyHeapAllocator(UINT64 maxBlockSize, UINT64 threshold, bool bNeedsThreadSafety, InnerAllocatorArgs&&... innerArgs) : // throw(std::bad_alloc)
+            DisjointBuddyHeapAllocator(maxBlockSize, threshold, std::forward<InnerAllocatorArgs>(innerArgs)...),
+            m_Lock(bNeedsThreadSafety)
         {}
         ThreadSafeBuddyHeapAllocator() = default;
         ThreadSafeBuddyHeapAllocator(ThreadSafeBuddyHeapAllocator&&) = default;
@@ -82,19 +78,19 @@ namespace D3D12TranslationLayer
         
         HeapSuballocationBlock Allocate(UINT64 size)
         {
-            auto scopedLock = std::lock_guard(m_Lock);
+            auto scopedLock = m_Lock.TakeLock();
             return DisjointBuddyHeapAllocator::Allocate(size);
         }
 
         void Deallocate(const HeapSuballocationBlock &block)
         {
-            auto scopedLock = std::lock_guard(m_Lock);
+            auto scopedLock = m_Lock.TakeLock();
             DisjointBuddyHeapAllocator::Deallocate(block);
         }
 
         auto GetInnerAllocation(const HeapSuballocationBlock &block) const
         {
-            auto scopedLock = std::lock_guard(m_Lock);
+            auto scopedLock = m_Lock.TakeLock();
             return DisjointBuddyHeapAllocator::GetInnerAllocation(block);
         }
 
@@ -102,7 +98,7 @@ namespace D3D12TranslationLayer
         using DisjointBuddyHeapAllocator::IsOwner;
 
     private:
-        mutable std::mutex m_Lock;
+        OptLock<> m_Lock;
     };
 
     // Allocator that will conditionally choose to individually allocate resources or suballocate based on a 

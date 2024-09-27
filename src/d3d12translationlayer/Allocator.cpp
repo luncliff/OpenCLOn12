@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-#include "Allocator.h"
-#include "ImmediateContext.hpp"
-#include "ImmediateContext.inl"
+#include "pch.h"
 
 namespace D3D12TranslationLayer
 {
@@ -20,7 +18,7 @@ namespace D3D12TranslationLayer
             std::move(unique_comptr<ID3D12Resource>(pResource)), 
             // Guaranteed to be finished since this is only called after
             // all suballocations have been through the deferred deletion queue
-            m_pContext->GetCompletedFenceValue());
+            m_pContext->GetCompletedFenceValue(CommandListType(m_HeapType)));
 
         // Leave ownership to the buffer pool
         pResource->Release();

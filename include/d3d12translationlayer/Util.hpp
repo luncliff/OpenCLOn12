@@ -2,11 +2,6 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
-#include <mutex>
-#include <optional>
-#include <assert.h>
-
 namespace D3D12TranslationLayer
 {
 #define ASSUME( _exp ) { assert( _exp ); __analysis_assume( _exp ); __assume( _exp ); }
@@ -14,12 +9,44 @@ namespace D3D12TranslationLayer
     class ImmediateContext;
     class Resource;
 
+    enum class COMMAND_LIST_TYPE {
+        GRAPHICS        = 0,
+        VIDEO_DECODE    = 1,
+        VIDEO_PROCESS   = 2,
+        MAX_VALID       = 3,
+        UNKNOWN   = MAX_VALID,
+    };
+
+    const UINT COMMAND_LIST_TYPE_GRAPHICS_MASK = (1 << (UINT)COMMAND_LIST_TYPE::GRAPHICS);
+    const UINT COMMAND_LIST_TYPE_VIDEO_DECODE_MASK    = (1 << (UINT)COMMAND_LIST_TYPE::VIDEO_DECODE);
+    const UINT COMMAND_LIST_TYPE_VIDEO_PROCESS_MASK    = (1 << (UINT)COMMAND_LIST_TYPE::VIDEO_PROCESS);
+    const UINT COMMAND_LIST_TYPE_VIDEO_MASK    = COMMAND_LIST_TYPE_VIDEO_DECODE_MASK |
+                                                 COMMAND_LIST_TYPE_VIDEO_PROCESS_MASK;
+    const UINT COMMAND_LIST_TYPE_ALL_MASK      = COMMAND_LIST_TYPE_GRAPHICS_MASK |
+                                                 COMMAND_LIST_TYPE_VIDEO_DECODE_MASK |
+                                                 COMMAND_LIST_TYPE_VIDEO_PROCESS_MASK;
+    const UINT COMMAND_LIST_TYPE_UNKNOWN_MASK = (1 << (UINT)COMMAND_LIST_TYPE::UNKNOWN);
+
     enum class AllocatorHeapType
     {
         None,
         Upload,
         Readback,
+        Decoder,
     };
+
+    inline COMMAND_LIST_TYPE CommandListType(AllocatorHeapType HeapType)
+    {
+        if (HeapType == AllocatorHeapType::Decoder)
+        {
+            return COMMAND_LIST_TYPE::VIDEO_DECODE;
+        }
+        else
+        {
+            assert(HeapType != AllocatorHeapType::None);
+            return COMMAND_LIST_TYPE::GRAPHICS;
+        }
+    }
 
     inline D3D12_HEAP_TYPE GetD3D12HeapType(AllocatorHeapType HeapType)
     {
@@ -30,6 +57,7 @@ namespace D3D12TranslationLayer
             return D3D12_HEAP_TYPE_READBACK;
 
         case AllocatorHeapType::Upload:
+        case AllocatorHeapType::Decoder:
         default:
             return D3D12_HEAP_TYPE_UPLOAD;
         }
@@ -215,6 +243,22 @@ namespace D3D12TranslationLayer
         return;
     }
 
+    enum EShaderStage : UINT8
+    {
+        e_PS,
+        e_VS,
+        e_GS,
+        e_HS,
+        e_DS,
+        e_CS,
+        ShaderStageCount,
+
+        // For UAVs, the EShaderStage enum is used for array indices.
+        e_Graphics = 0,
+        e_Compute = 1,
+        UAVStageCount
+    };
+
     //==================================================================================================================================
     //
     // unique_comptr, like unique_ptr except for Ref-held
@@ -380,7 +424,7 @@ namespace D3D12TranslationLayer
             // Leave uninitialized otherwise
             if constexpr (!std::is_trivially_constructible<T>::value)
             {
-                for (UINT i = 0; i < m_Size && i < InlineSize; ++i)
+                for (size_t i = 0; i < m_Size && i < InlineSize; ++i)
                 {
                     new (std::addressof(m_InlineArray[i])) T(std::forward<TConstructionArgs>(constructionArgs)...);
                 }
@@ -417,6 +461,20 @@ namespace D3D12TranslationLayer
         T const& operator[](UINT i) const { assert(i < m_Size); return i < InlineSize ? m_InlineArray[i] : m_Extra[i - InlineSize]; }
     };
 
+#if TRANSLATION_LAYER_DBG
+    enum ED3D11On12DebugFlags
+    {
+        Debug_FlushOnDraw = 0x1,
+        Debug_FlushOnDispatch = 0x2,
+        Debug_FlushOnRender = 0x4,
+        Debug_DisableIncrementalBindings = 0x8,
+        Debug_FlushOnDataUpload = 0x10,
+        Debug_FlushOnCopy = 0x20,
+        Debug_WaitOnFlush = 0x40,
+        Debug_StallExecution = 0x80,
+    };
+#endif
+
     enum class ResourceAllocationContext
     {
         ImmediateContextThreadLongLived,
@@ -434,6 +492,7 @@ namespace D3D12TranslationLayer
             return D3D12_RESOURCE_STATE_GENERIC_READ;
         case AllocatorHeapType::Readback:
             return D3D12_RESOURCE_STATE_COPY_DEST;
+        case AllocatorHeapType::Decoder:
         default:
             return D3D12_RESOURCE_STATE_COMMON;
         }
@@ -485,150 +544,73 @@ namespace D3D12TranslationLayer
         seed ^= hasher(v) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // A pool of objects that are recycled on specific fence values
-    // This class assumes single threaded caller
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    template<typename TResourceType>
-    class CFencePool
+    template <typename mutex_t = std::mutex>
+    class OptLock
     {
+        mutable std::optional<mutex_t> m_Lock;
     public:
-        void ReturnToPool(TResourceType&& Resource, UINT64 FenceValue) noexcept
+        std::unique_lock<mutex_t> TakeLock() const
         {
-            try
+            return m_Lock ? std::unique_lock<mutex_t>(*m_Lock) : std::unique_lock<mutex_t>();
+        }
+        OptLock(bool bHaveLock = false)
+        {
+            if (bHaveLock)
             {
-                auto lock = m_pLock ? std::unique_lock(*m_pLock) : std::unique_lock<std::mutex>();
-                m_Pool.emplace_back(FenceValue, std::move(Resource)); // throw( bad_alloc )
-            }
-            catch (std::bad_alloc&)
-            {
-                // Just drop the error
-                // All uses of this pool use unique_comptr, which will release the resource
+                m_Lock.emplace();
             }
         }
-
-        template <typename PFNCreateNew, typename... CreationArgType>
-        TResourceType RetrieveFromPool(UINT64 CurrentFenceValue, PFNCreateNew pfnCreateNew, const CreationArgType&... CreationArgs) noexcept(false)
+        void EnsureLock()
         {
-            auto lock = m_pLock ? std::unique_lock(*m_pLock) : std::unique_lock<std::mutex>();
-            TPool::iterator Head = m_Pool.begin();
-            if (Head == m_Pool.end() || (CurrentFenceValue < Head->first))
+            if (!m_Lock)
             {
-                return std::move(pfnCreateNew(CreationArgs...)); // throw( _com_error )
-            }
-
-            assert(Head->second);
-            TResourceType ret = std::move(Head->second);
-            m_Pool.erase(Head);
-            return std::move(ret);
-        }
-
-        void Trim(UINT64 TrimThreshold, UINT64 CurrentFenceValue)
-        {
-            auto lock = m_pLock ? std::unique_lock(*m_pLock) : std::unique_lock<std::mutex>();
-
-            TPool::iterator Head = m_Pool.begin();
-
-            if (Head == m_Pool.end() || (CurrentFenceValue < Head->first))
-            {
-                return;
-            }
-
-            UINT64 difference = CurrentFenceValue - Head->first;
-
-            if (difference >= TrimThreshold)
-            {
-                // only erase one item per 'pump'
-                assert(Head->second);
-                m_Pool.erase(Head);
+                m_Lock.emplace();
             }
         }
-
-        CFencePool(bool bLock = false) noexcept
-            : m_pLock(bLock ? new std::mutex : nullptr)
-        {
-        }
-        CFencePool(CFencePool &&other) noexcept
-        {
-            m_Pool = std::move(other.m_Pool);
-            m_pLock = std::move(other.m_pLock);
-        }
-        CFencePool& operator=(CFencePool &&other) noexcept
-        {
-            m_Pool = std::move(other.m_Pool);
-            m_pLock = std::move(other.m_pLock);
-            return *this;
-        }
-
-    protected:
-        typedef std::pair<UINT64, TResourceType> TPoolEntry;
-        typedef std::list<TPoolEntry> TPool;
-
-        CFencePool(CFencePool const& other) = delete;
-        CFencePool& operator=(CFencePool const& other) = delete;
-
-    protected:
-        TPool m_Pool;
-        std::unique_ptr<std::mutex> m_pLock;
+        bool HasLock() const { return m_Lock.has_value(); }
     };
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    // A pool of objects that are recycled on specific fence values
-    // with a maximum depth before blocking on RetrieveFromPool
-    // This class assumes single threaded caller
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-    template<typename TResourceType>
-    class CBoundedFencePool : public CFencePool<TResourceType>
+    template <typename T, size_t Size> struct CircularArray
     {
-    public:
-
-        template <typename PFNWaitForFenceValue, typename PFNCreateNew, typename... CreationArgType>
-        TResourceType RetrieveFromPool(UINT64 CurrentFenceValue, PFNWaitForFenceValue pfnWaitForFenceValue, PFNCreateNew pfnCreateNew, const CreationArgType&... CreationArgs) noexcept(false)
+        T m_Array[Size];
+        struct iterator
         {
-            auto lock = m_pLock ? std::unique_lock(*m_pLock) : std::unique_lock<std::mutex>();
-            TPool::iterator Head = m_Pool.begin();
-
-            if (Head == m_Pool.end())
+            using difference_type = ptrdiff_t;
+            using value_type = T;
+            using pointer = T*;
+            using reference = T&;
+            using iterator_category = std::random_access_iterator_tag;
+            T* m_Begin;
+            T* m_Current;
+            iterator( T* Begin, T* Current ) : m_Begin( Begin ), m_Current( Current ) {}
+            iterator increment( ptrdiff_t distance ) const
             {
-                return std::move(pfnCreateNew(CreationArgs...)); // throw( _com_error )
+                ptrdiff_t totalDistance = (distance + std::distance( m_Begin, m_Current )) % Size;
+                totalDistance = totalDistance >= 0 ? totalDistance : totalDistance + Size;
+                return iterator( m_Begin, m_Begin + totalDistance );
             }
-            else if (CurrentFenceValue < Head->first)
+            iterator& operator++() { *this = increment( 1 ); return *this; }
+            iterator operator++( int ) { iterator ret = *this; *this = increment( 1 ); return ret; }
+            iterator& operator--() { *this = increment( -1 ); return *this; }
+            iterator operator--( int ) { iterator ret = *this; *this = increment( -1 ); return ret; }
+            iterator operator+( ptrdiff_t v ) { return increment( v ); }
+            iterator& operator+=( ptrdiff_t v ) { *this = increment( v ); return *this; }
+            iterator operator-( ptrdiff_t v ) { return increment( -v ); }
+            iterator& operator-=( ptrdiff_t v ) { *this = increment( -v ); return *this; }
+            bool operator==( iterator const& o ) const { return o.m_Begin == m_Begin && o.m_Current == m_Current; }
+            bool operator!=( iterator const& o ) const { return !(o == *this); }
+            reference operator*() { return *m_Current; }
+            pointer operator->() { return m_Current; }
+            ptrdiff_t operator-( iterator const& o ) const
             {
-                if (m_Pool.size() < m_MaxInFlightDepth)
-                {
-                    return std::move(pfnCreateNew(CreationArgs...)); // throw( _com_error )
-                }
-                else
-                {
-                    pfnWaitForFenceValue(Head->first); // throw( _com_error )
-                }
+                assert( o.m_Begin == m_Begin );
+                ptrdiff_t rawDistance = std::distance( o.m_Current, m_Current );
+                return rawDistance >= 0 ? rawDistance : rawDistance + Size;
             }
+        };
 
-            assert(Head->second);
-            TResourceType ret = std::move(Head->second);
-            m_Pool.erase(Head);
-            return std::move(ret);
-        }
-
-        CBoundedFencePool(bool bLock = false, UINT MaxInFlightDepth = UINT_MAX) noexcept
-            : CFencePool(bLock),
-            m_MaxInFlightDepth(MaxInFlightDepth)
-        {
-        }
-        CBoundedFencePool(CBoundedFencePool&& other) noexcept
-            : CFencePool(other),
-            m_MaxInFlightDepth(other.m_MaxInFlightDepth)
-        {
-        }
-        CBoundedFencePool& operator=(CBoundedFencePool&& other) noexcept
-        {
-            m_Pool = std::move(other.m_Pool);
-            m_pLock = std::move(other.m_pLock);
-            m_MaxInFlightDepth = other.m_MaxInFlightDepth;
-            return *this;
-        }
-
-    protected:
-        UINT m_MaxInFlightDepth;
+        iterator begin() { return iterator( m_Array, m_Array ); }
+        T& operator[]( size_t index ) { return *(begin() + index); }
     };
+
 };

@@ -1,14 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-#include "ImmediateContext.hpp"
-#include "ImmediateContext.inl"
-#include "Residency.h"
+#include "pch.h"
 
 namespace D3D12TranslationLayer
 {
 
-void Internal::LRUCache::TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 CurrentBudget, std::vector<ID3D12Pageable*> &EvictionList, UINT64 FenceValue)
+void Internal::LRUCache::TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 CurrentBudget, std::vector<ID3D12Pageable*> &EvictionList, UINT64 FenceValues[])
 {
     EvictionList.clear();
     LIST_ENTRY* pResourceEntry = ResidentObjectListHead.Flink;
@@ -20,9 +18,12 @@ void Internal::LRUCache::TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 Curr
         {
             return;
         }
-        if (pObject->LastUsedFenceValue > FenceValue)
+        for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
         {
-            return;
+            if (pObject->LastUsedFenceValues[i] > FenceValues[i])
+            {
+                return;
+            }
         }
 
         assert(pObject->ResidencyStatus == ManagedObject::RESIDENCY_STATUS::RESIDENT);
@@ -43,7 +44,7 @@ void Internal::LRUCache::TrimToSyncPointInclusive(INT64 CurrentUsage, INT64 Curr
     }
 }
 
-void Internal::LRUCache::TrimAgedAllocations(UINT64 FenceValue, std::vector<ID3D12Pageable*> &EvictionList, UINT64 CurrentTimeStamp, UINT64 MinDelta)
+void Internal::LRUCache::TrimAgedAllocations(UINT64 FenceValues[], std::vector<ID3D12Pageable*> &EvictionList, UINT64 CurrentTimeStamp, UINT64 MinDelta)
 {
     LIST_ENTRY* pResourceEntry = ResidentObjectListHead.Flink;
     while (pResourceEntry != &ResidentObjectListHead)
@@ -54,9 +55,12 @@ void Internal::LRUCache::TrimAgedAllocations(UINT64 FenceValue, std::vector<ID3D
         {
             return;
         }
-        if (pObject->LastUsedFenceValue > FenceValue)
+        for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
         {
-            return;
+            if (pObject->LastUsedFenceValues[i] > FenceValues[i])
+            {
+                return;
+            }
         }
 
         assert(pObject->ResidencyStatus == ManagedObject::RESIDENCY_STATUS::RESIDENT);
@@ -75,9 +79,11 @@ void Internal::LRUCache::TrimAgedAllocations(UINT64 FenceValue, std::vector<ID3D
     }
 }
 
-HRESULT ResidencyManager::Initialize(IDXCoreAdapter *ParentAdapterDXCore)
+HRESULT ResidencyManager::Initialize(UINT DeviceNodeIndex, IDXCoreAdapter *ParentAdapterDXCore, IDXGIAdapter3 *ParentAdapterDXGI)
 {
+    NodeIndex = DeviceNodeIndex;
     AdapterDXCore = ParentAdapterDXCore;
+    AdapterDXGI = ParentAdapterDXGI;
 
     if (FAILED(ImmCtx.m_pDevice12->QueryInterface(&Device)))
     {
@@ -129,7 +135,10 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
             // Update the last sync point that this was used on
             // Note: This can be used for app command queues as well, but in that case, they'll
             // be pinned rather than relying on this implicit sync point tracking.
-            pObject->LastUsedFenceValue = ImmCtx.GetCommandListID();
+            if (CommandListIndex < (UINT)COMMAND_LIST_TYPE::MAX_VALID)
+            {
+                pObject->LastUsedFenceValues[CommandListIndex] = ImmCtx.GetCommandListID((COMMAND_LIST_TYPE)CommandListIndex);
+            }
 
             pObject->LastUsedTimestamp = CurrentTime.QuadPart;
             LRU.ObjectReferenced(pObject);
@@ -140,9 +149,14 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
         GetCurrentBudget(CurrentTime.QuadPart, &LocalMemory);
 
         UINT64 EvictionGracePeriod = GetCurrentEvictionGracePeriod(&LocalMemory);
-        UINT64 LastSubmittedFenceValue = ImmCtx.GetCommandListID() - 1;
-        UINT64 WaitedFenceValue = ImmCtx.GetCompletedFenceValue();
-        LRU.TrimAgedAllocations(WaitedFenceValue, EvictionList, CurrentTime.QuadPart, EvictionGracePeriod);
+        UINT64 LastSubmittedFenceValues[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+        UINT64 WaitedFenceValues[(UINT)COMMAND_LIST_TYPE::MAX_VALID];
+        for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
+        {
+            LastSubmittedFenceValues[i] = ImmCtx.GetCommandListID((COMMAND_LIST_TYPE)i) - 1;
+            WaitedFenceValues[i] = ImmCtx.GetCompletedFenceValue((COMMAND_LIST_TYPE)i);
+        }
+        LRU.TrimAgedAllocations(WaitedFenceValues, EvictionList, CurrentTime.QuadPart, EvictionGracePeriod);
 
         if (!EvictionList.empty())
         {
@@ -168,7 +182,8 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
 
                 if (AvailableSpace > 0)
                 {
-                    for (UINT32 i = MakeResidentIndex; i < MakeResidentList.size(); i++)
+                    assert(MakeResidentList.size() < MAXUINT32);
+                    for (UINT32 i = MakeResidentIndex; i < static_cast<UINT32>(MakeResidentList.size()); i++)
                     {
                         // If we try to make this object resident, will we go over budget?
                         if (BatchSize + MakeResidentList[i].pManagedObject->Size > UINT64(AvailableSpace))
@@ -208,14 +223,18 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
                     }
 
                     // If there is nothing to trim OR the only objects 'Resident' are the ones about to be used by this execute.
-                    bool ForceResidency = pResidentHead == nullptr || pResidentHead->LastUsedFenceValue > LastSubmittedFenceValue;
+                    bool ForceResidency = pResidentHead == nullptr;
+                    for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID && !ForceResidency; ++i)
+                    {
+                        ForceResidency = pResidentHead->LastUsedFenceValues[i] > LastSubmittedFenceValues[i];
+                    }
                     if (ForceResidency)
                     {
                         // Make resident the rest of the objects as there is nothing left to trim
                         UINT32 NumObjects = (UINT32)MakeResidentList.size() - ObjectsMadeResident;
 
                         // Gather up the remaining underlying objects
-                        for (UINT32 i = MakeResidentIndex; i < MakeResidentList.size(); i++)
+                        for (size_t i = MakeResidentIndex; i < MakeResidentList.size(); i++)
                         {
                             MakeResidentList[i].pUnderlying = MakeResidentList[i].pManagedObject->pUnderlying;
                         }
@@ -239,11 +258,11 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
                     }
 
                     // Wait until the GPU is done
-                    UINT64 FenceValueToWaitFor = pResidentHead ? pResidentHead->LastUsedFenceValue : LastSubmittedFenceValue;
-                    ImmCtx.WaitForFenceValue(FenceValueToWaitFor);
-                    WaitedFenceValue = FenceValueToWaitFor;
+                    UINT64 *FenceValuesToWaitFor = pResidentHead ? pResidentHead->LastUsedFenceValues : LastSubmittedFenceValues;
+                    WaitForSyncPoint(FenceValuesToWaitFor);
+                    std::copy(FenceValuesToWaitFor, FenceValuesToWaitFor + (UINT)COMMAND_LIST_TYPE::MAX_VALID, WaitedFenceValues);
 
-                    LRU.TrimToSyncPointInclusive(TotalUsage + INT64(SizeToMakeResident), TotalBudget, EvictionList, WaitedFenceValue);
+                    LRU.TrimToSyncPointInclusive(TotalUsage + INT64(SizeToMakeResident), TotalBudget, EvictionList, WaitedFenceValues);
 
                     [[maybe_unused]] HRESULT hrEvict = Device->Evict((UINT)EvictionList.size(), EvictionList.data());
                     assert(SUCCEEDED(hrEvict));
@@ -262,12 +281,18 @@ HRESULT ResidencyManager::ProcessPagingWork(UINT CommandListIndex, ResidencySet 
     }
 }
 
-static void GetDXCoreBudget(IDXCoreAdapter *AdapterDXCore, DXCoreAdapterMemoryBudget *InfoOut, DXCoreSegmentGroup Segment)
+static void GetDXCoreBudget(IDXCoreAdapter *AdapterDXCore, UINT NodeIndex, DXCoreAdapterMemoryBudget *InfoOut, DXCoreSegmentGroup Segment)
 {
     DXCoreAdapterMemoryBudgetNodeSegmentGroup InputParams = {};
+    InputParams.nodeIndex = NodeIndex;
     InputParams.segmentGroup = Segment;
 
     [[maybe_unused]] HRESULT hr = AdapterDXCore->QueryState(DXCoreAdapterState::AdapterMemoryBudget, &InputParams, InfoOut);
+    assert(SUCCEEDED(hr));
+}
+static void GetDXGIBudget(IDXGIAdapter3 *AdapterDXGI, UINT NodeIndex, DXGI_QUERY_VIDEO_MEMORY_INFO *InfoOut, DXGI_MEMORY_SEGMENT_GROUP Segment)
+{
+    [[maybe_unused]] HRESULT hr = AdapterDXGI->QueryVideoMemoryInfo(NodeIndex, Segment, InfoOut);
     assert(SUCCEEDED(hr));
 }
 
@@ -276,12 +301,31 @@ void ResidencyManager::GetCurrentBudget(UINT64 Timestamp, DXCoreAdapterMemoryBud
     if (Timestamp - LastBudgetTimestamp >= BudgetQueryPeriodTicks)
     {
         LastBudgetTimestamp = Timestamp;
-        DXCoreAdapterMemoryBudget Local, Nonlocal;
-        GetDXCoreBudget(AdapterDXCore, &Local, DXCoreSegmentGroup::Local);
-        GetDXCoreBudget(AdapterDXCore, &Nonlocal, DXCoreSegmentGroup::NonLocal);
-        CachedBudget.currentUsage = Local.currentUsage + Nonlocal.currentUsage;
-        CachedBudget.budget = Local.budget + Nonlocal.budget;
+        if (AdapterDXCore)
+        {
+            DXCoreAdapterMemoryBudget Local, Nonlocal;
+            GetDXCoreBudget(AdapterDXCore, NodeIndex, &Local, DXCoreSegmentGroup::Local);
+            GetDXCoreBudget(AdapterDXCore, NodeIndex, &Nonlocal, DXCoreSegmentGroup::NonLocal);
+            CachedBudget.currentUsage = Local.currentUsage + Nonlocal.currentUsage;
+            CachedBudget.budget = Local.budget + Nonlocal.budget;
+        }
+        else
+        {
+            DXGI_QUERY_VIDEO_MEMORY_INFO Local, Nonlocal;
+            GetDXGIBudget(AdapterDXGI, NodeIndex, &Local, DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+            GetDXGIBudget(AdapterDXGI, NodeIndex, &Nonlocal, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
+            CachedBudget.currentUsage = Local.CurrentUsage + Nonlocal.CurrentUsage;
+            CachedBudget.budget = Local.Budget + Nonlocal.Budget;
+        }
     }
     *InfoOut = CachedBudget;
+}
+
+void ResidencyManager::WaitForSyncPoint(UINT64 FenceValues[])
+{
+    for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; ++i)
+    {
+        ImmCtx.WaitForFenceValue((COMMAND_LIST_TYPE)i, FenceValues[i]);
+    }
 }
 }

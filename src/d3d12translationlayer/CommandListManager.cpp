@@ -1,36 +1,47 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-#include "Allocator.h"
-#include "CommandListManager.hpp"
-#include "CommandListManager.inl"
-#include "ImmediateContext.hpp"
-#include "Residency.h"
-#include "Resource.hpp"
+#include "pch.h"
 
 namespace D3D12TranslationLayer
 {
+    // must match COMMAND_LIST_TYPE enum
+    D3D12_COMMAND_LIST_TYPE D3D12TypeMap[] =
+    {
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+        D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS
+    };
+
+    static_assert(_countof(D3D12TypeMap) == (size_t)COMMAND_LIST_TYPE::MAX_VALID, "D3D12TypeMap must match COMMAND_LIST_TYPE enum.");
+
     //==================================================================================================================================
     // 
     //==================================================================================================================================
 
     //----------------------------------------------------------------------------------------------------------------------------------
-    CommandListManager::CommandListManager(ImmediateContext *pParent, ID3D12CommandQueue *pQueue)
+    CommandListManager::CommandListManager(ImmediateContext *pParent, ID3D12CommandQueue *pQueue, COMMAND_LIST_TYPE type)
         : m_pParent(pParent)
+        , m_type(type)
         , m_pCommandQueue(pQueue)
+        , m_bNeedSubmitFence(false)
         , m_pCommandList(nullptr)
         , m_pCommandAllocator(nullptr)
-        , m_AllocatorPool(false /*bLock*/, GetMaxInFlightDepth())
+        , m_AllocatorPool(false /*bLock*/, GetMaxInFlightDepth(type))
         , m_hWaitEvent(CreateEvent(nullptr, FALSE, FALSE, nullptr)) // throw( _com_error )
         , m_MaxAllocatedUploadHeapSpacePerCommandList(cMaxAllocatedUploadHeapSpacePerCommandList)
     {
         ResetCommandListTrackingData();
+
+        m_MaxAllocatedUploadHeapSpacePerCommandList = min(m_MaxAllocatedUploadHeapSpacePerCommandList,
+            m_pParent->m_CreationArgs.MaxAllocatedUploadHeapSpacePerCommandList);
         
         if (!m_pCommandQueue)
         {
             D3D12_COMMAND_QUEUE_DESC queue = {};
-            queue.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-            queue.NodeMask = 1;
-            queue.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+            queue.Type = GetD3D12CommandListType(m_type);
+            queue.NodeMask = m_pParent->GetNodeMask();
+            queue.Flags = m_pParent->m_CreationArgs.DisableGPUTimeout ?
+                D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT : D3D12_COMMAND_QUEUE_FLAG_NONE;
             CComPtr<ID3D12Device9> spDevice9;
             if (SUCCEEDED(m_pParent->m_pDevice12->QueryInterface(&spDevice9)))
             {
@@ -62,10 +73,14 @@ namespace D3D12TranslationLayer
         m_NumCommands++;
     }
 
+    void CommandListManager::DrawCommandAdded() noexcept
+    {
+        m_NumDraws++;
+    }
+
     void CommandListManager::DispatchCommandAdded() noexcept
     {
         m_NumDispatches++;
-        m_NumCommands++;
     }
 
     void CommandListManager::UploadHeapSpaceAllocated(UINT64 heapSize) noexcept
@@ -91,7 +106,7 @@ namespace D3D12TranslationLayer
 
         const bool bHaveEnoughCommandsForSubmit = 
             m_NumCommands > cMinRenderOpsForSubmit ||
-            m_NumDispatches > cMinDrawsOrDispatchesForSubmit;
+            m_NumDraws + m_NumDispatches > cMinDrawsOrDispatchesForSubmit;
         const bool bShouldOpportunisticFlush =
             m_NumFlushesWithNoReadback < cMinFlushesWithNoCPUReadback;
         const bool bShouldFreeUpMemory =
@@ -102,6 +117,15 @@ namespace D3D12TranslationLayer
             // If the GPU is idle, submit work to keep it busy
             if (m_Fence.GetCompletedValue() == m_commandListID - 1)
             {
+                if (g_hTracelogging)
+                {
+                    TraceLoggingWrite(g_hTracelogging,
+                                      "OpportunisticFlush",
+                                      TraceLoggingUInt32(m_NumCommands, "NumCommands"),
+                                      TraceLoggingUInt32(m_NumDraws, "NumDraws"),
+                                      TraceLoggingUInt32(m_NumDispatches, "NumDispatches"),
+                                      TraceLoggingUInt64(m_UploadHeapSpaceAllocated, "UploadHeapSpaceAllocated"));
+                }
                 SubmitCommandListImpl();
             }
         }
@@ -137,7 +161,7 @@ namespace D3D12TranslationLayer
             pfnWaitForFence,
             pfnCreateNew,
             m_pParent->m_pDevice12.get(),
-            D3D12_COMMAND_LIST_TYPE_COMPUTE
+            GetD3D12CommandListType(m_type)
             );
 
         // Create or recycle a command list
@@ -149,8 +173,8 @@ namespace D3D12TranslationLayer
         else
         {
             // Create a new command list
-            hr = m_pParent->m_pDevice12->CreateCommandList(1,
-                D3D12_COMMAND_LIST_TYPE_COMPUTE,
+            hr = m_pParent->m_pDevice12->CreateCommandList(m_pParent->GetNodeMask(),
+                GetD3D12CommandListType(m_type),
                 m_pCommandAllocator.get(),
                 nullptr,
                 IID_PPV_ARGS(&m_pCommandList));
@@ -159,13 +183,33 @@ namespace D3D12TranslationLayer
 
         ResetResidencySet();
         ResetCommandListTrackingData();
+
+#if DBG
+        if (m_pParent->DebugFlags() & Debug_StallExecution)
+        {
+            m_pCommandQueue->Wait(m_StallFence.Get(), m_commandListID);
+        }
+#endif
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
     void CommandListManager::ResetResidencySet()
     {
         m_pResidencySet = std::make_unique<ResidencySet>();
-        m_pResidencySet->Open(0);
+        m_pResidencySet->Open((UINT)m_type);
+    }
+
+    HRESULT CommandListManager::PreExecuteCommandQueueCommand()
+    {
+        m_bNeedSubmitFence = true;
+        m_pResidencySet->Close();
+        return m_pParent->GetResidencyManager().PreExecuteCommandQueueCommand(m_pCommandQueue.get(), (UINT)m_type, m_pResidencySet.get());
+    }
+
+    HRESULT CommandListManager::PostExecuteCommandQueueCommand()
+    {
+        ResetResidencySet();
+        return S_OK;
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -178,11 +222,20 @@ namespace D3D12TranslationLayer
     //----------------------------------------------------------------------------------------------------------------------------------
     void CommandListManager::SubmitCommandListImpl() // throws
     {
+        // Walk through the list of active queries
+        // and notify them that the command list is being submitted
+        for (LIST_ENTRY *pListEntry = m_pParent->m_ActiveQueryList.Flink; pListEntry != &m_pParent->m_ActiveQueryList; pListEntry = pListEntry->Flink)
+        {
+            Async* pAsync = CONTAINING_RECORD(pListEntry, Async, m_ActiveQueryListEntry);
+
+            pAsync->Suspend();
+        }
+
         CloseCommandList(m_pCommandList.get()); // throws
 
         m_pResidencySet->Close();
 
-        m_pParent->GetResidencyManager().ExecuteCommandList(m_pCommandQueue.get(), 0, m_pCommandList.get(), m_pResidencySet.get());
+        m_pParent->GetResidencyManager().ExecuteCommandList(m_pCommandQueue.get(), (UINT)m_type, m_pCommandList.get(), m_pResidencySet.get());
 
         // Return the command allocator to the pool for recycling
         m_AllocatorPool.ReturnToPool(std::move(m_pCommandAllocator), m_commandListID);
@@ -190,6 +243,28 @@ namespace D3D12TranslationLayer
         SubmitFence();
 
         PrepareNewCommandList();
+
+        // Walk through the list of active queries
+        // and notify them that a new command list has been prepared
+        for (LIST_ENTRY *pListEntry = m_pParent->m_ActiveQueryList.Flink; pListEntry != &m_pParent->m_ActiveQueryList; pListEntry = pListEntry->Flink)
+        {
+            Async* pAsync = CONTAINING_RECORD(pListEntry, Async, m_ActiveQueryListEntry);
+
+            pAsync->Resume();
+        }
+
+#if DBG
+        if (m_pParent->DebugFlags() & Debug_WaitOnFlush)
+        {
+            WaitForFenceValue(m_commandListID - 1); // throws
+        }
+#endif
+
+        if (m_type == COMMAND_LIST_TYPE::GRAPHICS)
+        {
+            m_pParent->m_DirtyStates |= e_DirtyOnNewCommandList;
+            m_pParent->m_StatesToReassert |= e_ReassertOnNewCommandList;
+        }
         m_pParent->PostSubmitNotification();
     }
 
@@ -199,24 +274,101 @@ namespace D3D12TranslationLayer
         // Reset the command allocator (indicating that the driver can recycle memory associated with it)
         ThrowFailure(m_pCommandAllocator->Reset());
 
-        ID3D12GraphicsCommandList *pGraphicsCommandList = GetGraphicsCommandList(m_pCommandList.get());
-        ThrowFailure(pGraphicsCommandList->Reset(m_pCommandAllocator.get(), nullptr));
+        static_assert(static_cast<UINT>(COMMAND_LIST_TYPE::MAX_VALID) == 3u, "CommandListManager::ResetCommandList must support all command list types.");
+        switch (m_type)
+        {
+            case COMMAND_LIST_TYPE::GRAPHICS:
+            {
+                ID3D12GraphicsCommandList *pGraphicsCommandList = GetGraphicsCommandList(m_pCommandList.get());
+                ThrowFailure(pGraphicsCommandList->Reset(m_pCommandAllocator.get(), nullptr));
+                break;
+            }
+
+            case COMMAND_LIST_TYPE::VIDEO_DECODE:
+            {
+                ThrowFailure(GetVideoDecodeCommandList(m_pCommandList.get())->Reset(m_pCommandAllocator.get()));
+                break;
+            }
+
+            case COMMAND_LIST_TYPE::VIDEO_PROCESS:
+            {
+                ThrowFailure(GetVideoProcessCommandList(m_pCommandList.get())->Reset(m_pCommandAllocator.get()));
+                break;
+            }
+
+            default:
+            {
+                ThrowFailure(E_UNEXPECTED);
+                break;
+            }
+        }
         InitCommandList();
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
     void CommandListManager::InitCommandList()
     {
-        ID3D12GraphicsCommandList *pGraphicsCommandList = GetGraphicsCommandList(m_pCommandList.get());
-        ID3D12DescriptorHeap* pHeaps[2] = { m_pParent->m_ViewHeap.m_pDescriptorHeap.get(), m_pParent->m_SamplerHeap.m_pDescriptorHeap.get() };
-        // Sampler heap is null for compute-only devices; don't include it in the count.
-        pGraphicsCommandList->SetDescriptorHeaps(m_pParent->ComputeOnly() ? 1 : 2, pHeaps);
+        static_assert(static_cast<UINT>(COMMAND_LIST_TYPE::MAX_VALID) == 3u, "CommandListManager::InitCommandList must support all command list types.");
+
+        switch (m_type)
+        {
+            case COMMAND_LIST_TYPE::GRAPHICS:
+            {
+                ID3D12GraphicsCommandList *pGraphicsCommandList = GetGraphicsCommandList(m_pCommandList.get());
+                ID3D12DescriptorHeap* pHeaps[2] = { m_pParent->m_ViewHeap.m_pDescriptorHeap.get(), m_pParent->m_SamplerHeap.m_pDescriptorHeap.get() };
+                // Sampler heap is null for compute-only devices; don't include it in the count.
+                pGraphicsCommandList->SetDescriptorHeaps(m_pParent->ComputeOnly() ? 1 : 2, pHeaps);
+                m_pParent->SetScissorRectsHelper();
+                break;
+            }
+
+            case COMMAND_LIST_TYPE::VIDEO_DECODE:
+            case COMMAND_LIST_TYPE::VIDEO_PROCESS:
+            {
+                // No initialization needed
+                break;
+            }
+
+            default:
+            {
+                ThrowFailure(E_UNEXPECTED);
+                break;
+            }
+        }
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
     void CommandListManager::CloseCommandList(ID3D12CommandList *pCommandList)
     {
-        ThrowFailure(GetGraphicsCommandList(pCommandList)->Close());
+        static_assert(static_cast<UINT>(COMMAND_LIST_TYPE::MAX_VALID) == 3u, "CommandListManager::CloseCommandList must support all command list types.");
+
+        switch (m_type)
+        {
+            case COMMAND_LIST_TYPE::GRAPHICS:
+            {
+                ThrowFailure(GetGraphicsCommandList(pCommandList)->Close());
+                break;
+            }
+
+            case COMMAND_LIST_TYPE::VIDEO_DECODE:
+            {
+                ThrowFailure(GetVideoDecodeCommandList(pCommandList)->Close());
+                break;
+            }
+
+            case COMMAND_LIST_TYPE::VIDEO_PROCESS:
+            {
+                ThrowFailure(GetVideoProcessCommandList(pCommandList)->Close());
+                break;
+            }
+
+            default:
+            {
+                ThrowFailure(E_UNEXPECTED);
+                break;
+            }
+        }
+
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -235,6 +387,7 @@ namespace D3D12TranslationLayer
     {
         m_pCommandQueue->Signal(m_Fence.Get(), m_commandListID);
         IncrementFence();
+        m_bNeedSubmitFence = false;
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -269,6 +422,10 @@ namespace D3D12TranslationLayer
         {
             SubmitCommandListImpl(); // throws
         }
+        else if (m_bNeedSubmitFence)
+        {
+            SubmitFence();
+        }
     }
 
     //----------------------------------------------------------------------------------------------------------------------------------
@@ -286,6 +443,13 @@ namespace D3D12TranslationLayer
         {
             return E_OUTOFMEMORY;
         }
+
+#if DBG
+        if (m_pParent->DebugFlags() & Debug_StallExecution)
+        {
+            m_StallFence.Signal(FenceValue);
+        }
+#endif
 
         return m_Fence.SetEventOnCompletion(FenceValue, hEvent);
     }
@@ -321,9 +485,18 @@ namespace D3D12TranslationLayer
         {
             if (IsImmediateContextThread)
             {
-                assert(HasCommands());
                 assert(CurCmdListID == FenceValue);
-                SubmitCommandListImpl(); // throws
+                if (HasCommands())
+                {
+                    SubmitCommandListImpl(); // throws
+                }
+                else
+                {
+                    // We submitted only an initial data command list, but no fence
+                    // Just insert the fence now, and increment its value
+                    assert(m_bNeedSubmitFence);
+                    SubmitFence();
+                }
                 CurCmdListID = m_commandListID;
                 assert(CurCmdListID > FenceValue);
             }
@@ -339,6 +512,16 @@ namespace D3D12TranslationLayer
         }
         ThrowFailure(m_Fence.SetEventOnCompletion(FenceValue, m_hWaitEvent));
 
+#if DBG
+        if (m_pParent->DebugFlags() & Debug_StallExecution)
+        {
+            m_StallFence.Signal(FenceValue);
+        }
+#endif
+
+#ifdef USE_PIX
+        PIXNotifyWakeFromFenceSignal(m_hWaitEvent);
+#endif
         DWORD waitRet = WaitForSingleObject(m_hWaitEvent, INFINITE);
         UNREFERENCED_PARAMETER(waitRet);
         assert(waitRet == WAIT_OBJECT_0);
@@ -353,4 +536,17 @@ namespace D3D12TranslationLayer
 
         m_pResidencySet->Close();
     }
+
+    D3D12_COMMAND_LIST_TYPE CommandListManager::GetD3D12CommandListType(COMMAND_LIST_TYPE type)
+    {
+        if (ComputeOnly())
+        {
+            return D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        }
+        else
+        {
+            return D3D12TypeMap[(UINT)type];
+        }
+    }
+
 }

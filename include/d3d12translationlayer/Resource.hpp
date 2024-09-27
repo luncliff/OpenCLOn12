@@ -2,15 +2,6 @@
 // Licensed under the MIT License.
 #pragma once
 
-#include "D3D12TranslationLayerDependencyIncludes.h"
-#include "Allocator.h"
-#include "DeviceChild.hpp"
-#include "Residency.h"
-#include "ResourceState.hpp"
-#include "SubresourceHelpers.hpp"
-#include "Util.hpp"
-#include <functional>
-
 namespace D3D12TranslationLayer
 {
 
@@ -52,10 +43,17 @@ namespace D3D12TranslationLayer
 
     enum MAP_TYPE
     {
-        MAP_TYPE_READ,
-        MAP_TYPE_WRITE,
-        MAP_TYPE_READWRITE,
-        MAP_TYPE_WRITE_NOOVERWRITE,
+        MAP_TYPE_READ = 1,
+        MAP_TYPE_WRITE = 2,
+        MAP_TYPE_READWRITE = 3,
+        MAP_TYPE_WRITE_DISCARD = 4,
+        MAP_TYPE_WRITE_NOOVERWRITE = 5,
+    };
+
+    enum class DeferredDestructionType
+    {
+        Submission,
+        Completion
     };
 
     struct MappedSubresource
@@ -140,6 +138,12 @@ namespace D3D12TranslationLayer
         D3D12_RESOURCE_DIMENSION m_resourceDimension;
     };
 
+    enum class FormatEmulation
+    {
+        None = 0,
+        YV12
+    };
+
     //TODO: remove this once runtime dependecy has been removed
     struct ResourceCreationArgs
     {
@@ -179,11 +183,19 @@ namespace D3D12TranslationLayer
 
         bool m_isPlacedTexture;
 
+        bool m_bBoundForStreamOut;
         bool m_bManageResidency;
+        bool m_bTriggerDeferredWaits;
+        bool m_bIsD3D9on12Resource;
+
+        FormatEmulation m_FormatEmulation = FormatEmulation::None;
 
         // Setting this function overrides the normal creation method used by the translation layer.
         // It can be used for smuggling a resource through the create path or using alternate creation APIs.
-        std::function<void(ResourceCreationArgs const&, ID3D12Resource**)> m_PrivateCreateFn;
+        std::function<void(ResourceCreationArgs const&, ID3D12SwapChainAssistant*, ID3D12Resource**)> m_PrivateCreateFn;
+
+        //11on12 Only
+        UINT m_OffsetToStreamOutputSuffix;
 
         AllocatorHeapType m_heapType = AllocatorHeapType::None;
     };
@@ -349,6 +361,23 @@ namespace D3D12TranslationLayer
         D3D12ResourceSuballocation Decode() const { return D3D12ResourceSuballocation(GetResource(), DecodeSuballocation()); }
     };
 
+    struct OutstandingResourceUse
+    {
+        OutstandingResourceUse(COMMAND_LIST_TYPE type, UINT64 value)
+        {
+            commandListType = type;
+            fenceValue = value;
+        }
+        COMMAND_LIST_TYPE commandListType;
+        UINT64 fenceValue;
+
+        bool operator==(OutstandingResourceUse const& rhs) const
+        {
+            return commandListType == rhs.commandListType &&
+                   fenceValue == rhs.fenceValue;
+        }
+    };
+
     //==================================================================================================================================
     // Resource
     // Stores data responsible for remapping D3D11 resources to underlying D3D12 resources and heaps
@@ -372,12 +401,18 @@ namespace D3D12TranslationLayer
         volatile UINT m_RefCount = 0;
 
     public:
-        static unique_comptr<Resource> CreateResource(ImmediateContext* pDevice, ResourceCreationArgs& createArgs, ResourceAllocationContext threadingContext) noexcept(false);
+        static TRANSLATION_API unique_comptr<Resource> CreateResource(ImmediateContext* pDevice, ResourceCreationArgs& createArgs, ResourceAllocationContext threadingContext) noexcept(false);
+        static TRANSLATION_API unique_comptr<Resource> OpenResource(ImmediateContext* pDevice,
+            ResourceCreationArgs& createArgs,
+            _In_ IUnknown *pResource,
+            DeferredDestructionType deferredDestructionType,
+            _In_ D3D12_RESOURCE_STATES currentState) noexcept(false);
+
 
         inline void AddRef() { InterlockedIncrement(&m_RefCount); }
         inline void Release() { if (InterlockedDecrement(&m_RefCount) == 0) { delete this; } }
 
-        void UsedInCommandList(UINT64 id);
+        void UsedInCommandList(COMMAND_LIST_TYPE commandListType, UINT64 id);
 
         ResourceCreationArgs* Parent() { return &m_creationArgs; }
         AppResourceDesc* AppDesc() { return &m_creationArgs.m_appDesc; }
@@ -412,14 +447,92 @@ namespace D3D12TranslationLayer
         static void FillSubresourceDesc(ID3D12Device* pDevice, DXGI_FORMAT, UINT Width, UINT Height, UINT Depth, _Out_ D3D12_PLACED_SUBRESOURCE_FOOTPRINT& Placement) noexcept;
         UINT DepthPitch(UINT Subresource) noexcept;
 
+        template<typename TViewIface> UINT GetUniqueness() const noexcept { return m_AllUniqueness; }
+        template<> UINT GetUniqueness<ShaderResourceViewType>() const noexcept { return m_SRVUniqueness; }
+
+        template<typename TViewIface> void ViewBound(View<TViewIface>* pView, EShaderStage stage, UINT slot) { m_currentBindings.ViewBound(pView, stage, slot); }
+        template<typename TViewIface> void ViewUnbound(View<TViewIface>* pView, EShaderStage stage, UINT slot) { m_currentBindings.ViewUnbound(pView, stage, slot); }
+
+        inline UINT GetOffsetToStreamOutputSuffix() { return m_OffsetToStreamOutputSuffix; }
         RESOURCE_USAGE GetEffectiveUsage() const { return m_effectiveUsage; }
         inline bool IsBloatedConstantBuffer() { return (AppDesc()->BindFlags() & RESOURCE_BIND_FLAGS::RESOURCE_BIND_CONSTANT_BUFFER) && AppDesc()->Width() % D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT != 0; }
-        inline bool IsDefaultResourceBloated() { return IsBloatedConstantBuffer(); }
+        inline bool IsDefaultResourceBloated() { return m_OffsetToStreamOutputSuffix != 0 || IsBloatedConstantBuffer(); }
+        inline bool TriggersDeferredWaits() const { return m_creationArgs.m_bTriggerDeferredWaits; }
+        inline FormatEmulation GetFormatEmulation() const { return m_creationArgs.m_FormatEmulation; }
+        inline bool IsInplaceFormatEmulation() const { return GetFormatEmulation() == FormatEmulation::YV12; }  // Format emulation modifies the resource in place for map/unmap
+
+        bool WaitForOutstandingResourcesIfNeeded(bool DoNotWait);
+
+        void AddHeapToTilePool(unique_comptr<ID3D12Heap> spHeap)
+        {
+            auto HeapDesc = spHeap->GetDesc();
+            m_TilePool.m_Allocations.emplace_back(static_cast<UINT>(HeapDesc.SizeInBytes), 0); // throw( bad_alloc )
+            auto& Allocation = m_TilePool.m_Allocations.front();
+            Allocation.m_spUnderlyingBufferHeap = std::move(spHeap);
+        }
+
+        inline void SetMinLOD(float MinLOD) { m_MinLOD = MinLOD; }
+        inline float GetMinLOD() { return m_MinLOD; }
+
+        inline void SetWaitForCompletionRequired(bool value) { m_bWaitForCompletionRequired = value; }
+        void ClearInputBindings();
+        void ClearOutputBindings();
+
+        UINT GetCommandListTypeMaskFromUsed()
+        {
+            UINT typeMask = 0;
+            for (UINT i = 0; i < (UINT)COMMAND_LIST_TYPE::MAX_VALID; i++)
+            {
+                if (m_LastUsedCommandListID[i] != 0)
+                {
+                    typeMask |= (1 << i);
+                }
+            }
+            return typeMask;
+        }
+
+        UINT GetCommandListTypeMask()
+        {
+            UINT typeMask = m_Identity->m_currentState.GetCommandListTypeMask();
+            if (typeMask == COMMAND_LIST_TYPE_UNKNOWN_MASK)
+            {
+                typeMask = GetCommandListTypeMaskFromUsed();
+            }
+            return typeMask;
+        }
+
+        UINT GetCommandListTypeMask(const CViewSubresourceSubset &viewSubresources)
+        {
+            UINT typeMask = m_Identity->m_currentState.GetCommandListTypeMask(viewSubresources);
+            if (typeMask == COMMAND_LIST_TYPE_UNKNOWN_MASK)
+            {
+                typeMask = GetCommandListTypeMaskFromUsed();
+            }
+            return typeMask;
+        }
+
+        UINT GetCommandListTypeMask(UINT Subresource)
+        {
+            UINT typeMask = m_Identity->m_currentState.GetCommandListTypeMask(Subresource);
+            if (typeMask == COMMAND_LIST_TYPE_UNKNOWN_MASK)
+            {
+                typeMask = GetCommandListTypeMaskFromUsed();
+            }
+            return typeMask;
+        }
+
 
         // Used for when we are reusing a generic buffer that's used as an intermediate copy resource. Because
         // we're constantly copying to/from different resources with different footprints, we need to make sure we 
         // update the app desc so that copies will use the right footprint
         void UpdateAppDesc(const AppResourceDesc &AppDesc);
+
+        void SwapIdentities(Resource& Other)
+        {
+            std::swap(m_Identity, Other.m_Identity);
+            std::swap(m_SubresourcePlacement[0].Offset, Other.m_SubresourcePlacement[0].Offset);
+            DeviceChild::SwapIdentities(Other);
+        }
 
         void AddToResidencyManager(bool bIsResident);
 
@@ -447,7 +560,11 @@ namespace D3D12TranslationLayer
 
             if (m_creationArgs.m_heapType == AllocatorHeapType::None)
             {
-                if (AppDesc()->CPUAccessFlags() & RESOURCE_CPU_ACCESS_READ)
+                if (IsDecoderCompressedBuffer())
+                {
+                    return AllocatorHeapType::Decoder;
+                }
+                else if (AppDesc()->CPUAccessFlags() & RESOURCE_CPU_ACCESS_READ)
                 {
                     return AllocatorHeapType::Readback;
                 }
@@ -468,6 +585,11 @@ namespace D3D12TranslationLayer
             return m_creationArgs.m_desc12.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && m_creationArgs.IsShared() && AppDesc()->CPUAccessFlags();
         }
 
+        bool IsDecoderCompressedBuffer()
+        {
+            return Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER && (AppDesc()->BindFlags() &  RESOURCE_BIND_DECODER);
+        }
+
         bool OwnsReadbackHeap()
         {
             // These are cases where we can't suballocate out of larger heaps because resource transitions can only be done on heap granularity 
@@ -475,12 +597,21 @@ namespace D3D12TranslationLayer
             // 
             // Note: We don't need to do this for dynamic write-only buffers because those buffers always stay in GENRIC_READ and only transition 
             // at copies (and transition back to GENERIC read directly afterwards) 
-            return m_creationArgs.m_heapDesc.Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE ||
-                   (AppDesc()->Usage() == RESOURCE_USAGE_DYNAMIC && Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER && (AppDesc()->CPUAccessFlags() & RESOURCE_CPU_ACCESS_READ) != 0);
+            if (IsDecoderCompressedBuffer())
+            {
+                return false;
+            }
+            else
+            {
+                return AppDesc()->BindFlags() &  RESOURCE_BIND_DECODER ||
+                       m_creationArgs.m_heapDesc.Properties.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE ||
+                       (AppDesc()->Usage() == RESOURCE_USAGE_DYNAMIC && Parent()->ResourceDimension12() == D3D12_RESOURCE_DIMENSION_BUFFER && (AppDesc()->CPUAccessFlags() & RESOURCE_CPU_ACCESS_READ) != 0);
+            }
         }
 
     private:
         void InitializeSubresourceDescs() noexcept(false);
+        void InitializeTilingData() noexcept;
 
         void CreateUnderlying(ResourceAllocationContext threadingContext) noexcept(false);
 
@@ -534,13 +665,21 @@ namespace D3D12TranslationLayer
             std::unique_ptr<ResidencyManagedObjectWrapper> m_pResidencyHandle;
 
             UINT64 m_LastUAVAccess = 0;
+
+            bool HasRestrictedOutstandingResources()
+            {
+                return m_MaxOutstandingResources != 0xffffffff;
+            }
+
+            std::vector<OutstandingResourceUse> m_OutstandingResources;
+            UINT m_MaxOutstandingResources = 0xffffffff;
         };
 
         std::unique_ptr<SResourceIdentity> AllocateResourceIdentity(UINT NumSubresources, bool bSimultaneousAccess)
         {
             struct VoidDeleter { void operator()(void* p) { operator delete(p); } };
 
-            size_t ObjectSize = sizeof(SResourceIdentity) + CCurrentResourceState::CalcPreallocationSize(NumSubresources);
+            size_t ObjectSize = sizeof(SResourceIdentity) + CCurrentResourceState::CalcPreallocationSize(NumSubresources, bSimultaneousAccess);
             std::unique_ptr<void, VoidDeleter> spMemory(operator new(ObjectSize));
 
             void* pPreallocatedMemory = reinterpret_cast<SResourceIdentity*>(spMemory.get()) + 1;
@@ -555,10 +694,101 @@ namespace D3D12TranslationLayer
         }
 
         SResourceIdentity* GetIdentity() { return m_Identity.get(); }
+        CResourceBindings& GetBindingState() { return m_currentBindings; }
 
         ManagedObject *GetResidencyHandle();
     private:
+        template <typename ViewType, typename UnbindFunction>
+        void UnbindList(LIST_ENTRY list, UnbindFunction& unbindFunction)
+        {
+            for (LIST_ENTRY *pListEntry = list.Flink; pListEntry != &list;)
+            {
+                auto pViewBindings = CONTAINING_RECORD(pListEntry, CViewBindings<ViewType>, m_ViewBindingList);
+
+                for (UINT stage = 0; stage < _countof(pViewBindings->m_BindPoints); ++stage)
+                {
+                    auto& bindings = pViewBindings->m_BindPoints[stage];
+                    for (UINT slot = 0; bindings.any(); ++slot)
+                    {
+                        if (bindings.test(slot))
+                        {
+                            unbindFunction(stage, slot);
+                        }
+                    }
+                }
+
+                D3D12TranslationLayer::RemoveEntryList(&pViewBindings->m_ViewBindingList);
+                D3D12TranslationLayer::InitializeListHead(&pViewBindings->m_ViewBindingList);
+
+                if (D3D12TranslationLayer::IsListEmpty(pListEntry))
+                {
+                    break;
+                }
+            }
+        }
+
+        void UnBindAsRTV();
+        void UnBindAsDSV();
+        void UnBindAsSRV();
+        void UnBindAsCBV();
+        void UnBindAsVB();
+        void UnBindAsIB();
+        float m_MinLOD;
+
         ResourceCreationArgs m_creationArgs;
+
+        struct STilePoolAllocation
+        {
+            // For tier 1, attributed heaps need to be used
+            // For tier 2, only the buffer heap is used
+            unique_comptr<ID3D12Heap> m_spUnderlyingBufferHeap;
+            unique_comptr<ID3D12Heap> m_spUnderlyingTextureHeap;
+            UINT m_Size;
+            UINT m_TileOffset;
+
+            STilePoolAllocation(UINT size, UINT offset) : m_Size(size), m_TileOffset(offset) { }
+            STilePoolAllocation() : m_Size(0), m_TileOffset(0) { }
+            STilePoolAllocation(STilePoolAllocation&& other)
+                : m_spUnderlyingBufferHeap(std::move(other.m_spUnderlyingBufferHeap))
+                , m_spUnderlyingTextureHeap(std::move(other.m_spUnderlyingTextureHeap))
+                , m_Size(std::move(other.m_Size))
+                , m_TileOffset(std::move(other.m_TileOffset))
+            { }
+        };
+        struct STilePoolData
+        {
+            std::vector<STilePoolAllocation> m_Allocations;
+        };
+        struct STiledResourceData
+        {
+            STiledResourceData(UINT NumSubresources, void*& pPreallocatedMemory)
+                : m_SubresourceTiling(NumSubresources, pPreallocatedMemory)
+            {
+            }
+
+            Resource* m_pTilePool = nullptr;
+            PreallocatedArray<D3D12_SUBRESOURCE_TILING> m_SubresourceTiling;
+            UINT m_NumStandardMips = 0;
+            UINT m_NumTilesForResource = 0;
+            UINT m_NumTilesForPackedMips = 0;
+        };
+
+        enum class EmulatedFormatMapState { Write, ReadWrite, Read, None };
+
+        struct SEmulatedFormatSubresourceStagingAllocation
+        {
+            struct Deallocator
+            {
+                void operator()(void* pData) { AlignedHeapFree16(pData); }
+            };
+            std::unique_ptr<BYTE, Deallocator> m_pInterleavedData;
+        };
+
+        struct SEmulatedFormatSubresourceStagingData
+        {
+            EmulatedFormatMapState m_MapState = EmulatedFormatMapState::None;
+            UINT m_MapRefCount = 0;
+        };
 
         // Note: Must be declared before all members which have arrays sized by subresource index
         // For texture formats with both depth and stencil (D24S8 and D32S8X24),
@@ -570,6 +800,11 @@ namespace D3D12TranslationLayer
 
         // All resources
         std::unique_ptr<SResourceIdentity> m_Identity;
+
+        CResourceBindings m_currentBindings;
+
+        UINT m_SRVUniqueness; // MinLOD, renaming
+        UINT m_AllUniqueness; // Rotate
 
         // Internally used for indexing into arrays of data for dynamic
         // textures. Because textures with non-opaque planes share
@@ -613,7 +848,26 @@ namespace D3D12TranslationLayer
         // Dynamic/staging textures:
         PreallocatedArray<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> m_SubresourcePlacement;
 
+        // Staging textures:
+        PreallocatedArray<SEmulatedFormatSubresourceStagingAllocation> m_FormatEmulationStagingAllocation;
+
+        auto &GetFormatEmulationSubresourceStagingAllocation(UINT Subresource)
+        {
+            return m_FormatEmulationStagingAllocation[GetDynamicTextureIndex(Subresource)].m_pInterleavedData;
+        }
+
+        PreallocatedArray<SEmulatedFormatSubresourceStagingData> m_FormatEmulationStagingData;
+
         PreallocatedArray<UINT64> m_LastCommandListID;
+
+        // For streamoutput buffers, 11on12 will add some bytes to the end
+        // to hold a SStreamOutputSuffix
+        // This contains the byte offset to that structure
+        UINT m_OffsetToStreamOutputSuffix;
+
+        // Tiled resources
+        STilePoolData m_TilePool;
+        STiledResourceData m_TiledResource;
 
         // The effective usage of the resource.  Row-major default textures are
         // treated like staging textures, because D3D12 doesn't support row-major
@@ -642,5 +896,13 @@ namespace D3D12TranslationLayer
         }
 
         bool m_isValid = false;
+
+        // Fence used to ensure residency operations queued as part of UnwrapUnderlyingResource
+        // operations are completed if the caller returns a resource without scheduling any work.
+        DeferredWait m_UnwrapUnderlyingResidencyDeferredWait;
+
+public:
+        HRESULT AddFenceForUnwrapResidency(ID3D12CommandQueue* pQueue);
+
     };
 };

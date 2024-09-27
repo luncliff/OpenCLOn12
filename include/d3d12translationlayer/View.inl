@@ -66,19 +66,43 @@ namespace D3D12TranslationLayer
 
     //----------------------------------------------------------------------------------------------------------------------------------
     template<typename TIface>
+    void View<TIface>::ViewBound(UINT slot, EShaderStage stage) noexcept
+    {
+        m_currentBindings.ViewBound(stage, slot);
+        m_pResource->ViewBound(this, stage, slot);
+        m_pParent->TransitionResourceForBindings(this);
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<typename TIface>
+    void View<TIface>::ViewUnbound(UINT slot, EShaderStage stage) noexcept
+    {
+        m_currentBindings.ViewUnbound(stage, slot);
+        m_pResource->ViewUnbound(this, stage, slot);
+        m_pParent->TransitionResourceForBindings(this);
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<typename TIface>
     const typename View<TIface>::TDesc12& View<TIface>::GetDesc12() noexcept
     {
-        typedef decltype(TDesc12::Buffer) TBufferDesc12;
-        if (m_pResource->AppDesc()->ResourceDimension() == D3D11_RESOURCE_DIMENSION_BUFFER)
+        __if_exists(TDesc12::Buffer)
         {
-            UINT Divisor = GetByteAlignment(m_Desc.Format);
-            if (m_Desc.Buffer.StructureByteStride != 0)
+            typedef decltype(TDesc12::Buffer) TBufferDesc12;
+            if (m_pResource->AppDesc()->ResourceDimension() == D3D11_RESOURCE_DIMENSION_BUFFER)
             {
-                Divisor = m_Desc.Buffer.StructureByteStride;
+                UINT Divisor = GetByteAlignment(m_Desc.Format);
+                __if_exists(TBufferDesc12::StructureByteStride)
+                {
+                    if (m_Desc.Buffer.StructureByteStride != 0)
+                    {
+                        Divisor = m_Desc.Buffer.StructureByteStride;
+                    }
+                }
+                UINT ByteOffset = GetDynamicBufferOffset(m_pResource);
+                assert(ByteOffset % Divisor == 0);
+                m_Desc.Buffer.FirstElement = APIFirstElement + ByteOffset / Divisor;
             }
-            UINT ByteOffset = GetDynamicBufferOffset(m_pResource);
-            assert(ByteOffset % Divisor == 0);
-            m_Desc.Buffer.FirstElement = APIFirstElement + ByteOffset / Divisor;
         }
         return m_Desc;
     }
@@ -87,9 +111,9 @@ namespace D3D12TranslationLayer
     template<typename TIface>
     HRESULT View<TIface>::RefreshUnderlying() noexcept
     {
-        if (m_ViewUniqueness == UINT_MAX)
+        if (m_ViewUniqueness != m_pResource->GetUniqueness<TIface>())
         {
-            UpdateMinLOD(0.0f);
+            UpdateMinLOD(m_pResource->GetMinLOD());
 
             const TDesc12 &Desc = GetDesc12();
             (m_pParent->m_pDevice12.get()->*CViewMapper<TIface>::GetCreate())(
@@ -97,7 +121,7 @@ namespace D3D12TranslationLayer
                 &Desc,
                 m_Descriptor);
 
-            m_ViewUniqueness = 0;
+            m_ViewUniqueness = m_pResource->GetUniqueness<TIface>();
             return S_OK;
         }
         return S_FALSE;
@@ -108,19 +132,41 @@ namespace D3D12TranslationLayer
     template<>
     inline HRESULT View<UnorderedAccessViewType>::RefreshUnderlying() noexcept
     {
-        if (m_ViewUniqueness == UINT_MAX)
-        {
-            const TDesc12 &Desc = GetDesc12();
+        // UAVs are always refreshed (to ensure that the proper counter resource is passed in)
+        UAV* p11on12UAV = static_cast<UAV*>(this);
+        const TDesc12 &Desc = GetDesc12();
 
-            m_pParent->m_pDevice12.get()->CreateUnorderedAccessView(
-                m_pResource->GetUnderlyingResource(),
-                nullptr,
-                &Desc,
-                m_Descriptor
-                );
+        m_pParent->m_pDevice12.get()->CreateUnorderedAccessView(
+            m_pResource->GetUnderlyingResource(),
+            p11on12UAV->m_pCounterResource.get(),
+            &Desc,
+            m_Descriptor
+            );
 
-            m_ViewUniqueness = 0;
-        }
+        m_ViewUniqueness = m_pResource->GetUniqueness<UnorderedAccessViewType>();
+        return S_OK;
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    // Specialized because no underlying D3D12 video views
+    template<>
+    inline HRESULT View<VideoDecoderOutputViewType>::RefreshUnderlying() noexcept
+    {
+        m_ViewUniqueness = m_pResource->GetUniqueness<VideoDecoderOutputViewType>();
+        return S_OK;
+    }
+
+    template<>
+    inline HRESULT View<VideoProcessorInputViewType>::RefreshUnderlying() noexcept
+    {
+        m_ViewUniqueness = m_pResource->GetUniqueness<VideoProcessorInputViewType>();
+        return S_OK;
+    }
+
+    template<>
+    inline HRESULT View<VideoProcessorOutputViewType>::RefreshUnderlying() noexcept
+    {
+        m_ViewUniqueness = m_pResource->GetUniqueness<VideoProcessorOutputViewType>();
         return S_OK;
     }
 
@@ -143,6 +189,7 @@ namespace D3D12TranslationLayer
         (UINT16)ViewResource.AppDesc()->ArraySize(),
         (UINT8)ViewResource.AppDesc()->NonOpaquePlaneCount() * ViewResource.SubresourceMultiplier())),
         m_Desc(Desc),
+        m_BindRefs(0),
         APIFirstElement(0)
     {
         __if_exists(TDesc12::Buffer)
@@ -158,6 +205,67 @@ namespace D3D12TranslationLayer
     View<TIface>::~View() noexcept
     {
         m_pParent->GetViewAllocator<TIface>().FreeHeapSlot(m_Descriptor, m_DescriptorHeapIndex);
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    // Specialized because no underlying D3D12 video views
+    template<>
+    inline View<VideoDecoderOutputViewType>::View(ImmediateContext* pDevice, const typename TDesc12 &Desc, Resource &ViewResource) noexcept(false)
+        : ViewBase(pDevice,
+            &ViewResource,
+            CViewSubresourceSubset(Desc,
+                (UINT8)ViewResource.AppDesc()->MipLevels(),
+                (UINT16)ViewResource.AppDesc()->ArraySize(),
+                (UINT8)ViewResource.AppDesc()->NonOpaquePlaneCount() * ViewResource.SubresourceMultiplier())),
+        m_Desc(Desc),
+        m_BindRefs(0)
+    {
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<>
+    inline View<VideoDecoderOutputViewType>::~View() noexcept
+    {
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<>
+    inline View<VideoProcessorInputViewType>::View(ImmediateContext* pDevice, const typename TDesc12 &Desc, Resource &ViewResource) noexcept(false)
+        : ViewBase(pDevice,
+            &ViewResource,
+            CViewSubresourceSubset(Desc,
+                (UINT8)ViewResource.AppDesc()->MipLevels(),
+                (UINT16)ViewResource.AppDesc()->ArraySize(),
+                (UINT8)ViewResource.AppDesc()->NonOpaquePlaneCount() * ViewResource.SubresourceMultiplier())),
+        m_Desc(Desc),
+        m_BindRefs(0)
+    {
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<>
+    inline View<VideoProcessorInputViewType>::~View() noexcept
+    {
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<>
+    inline View<VideoProcessorOutputViewType>::View(ImmediateContext* pDevice, const typename TDesc12 &Desc, Resource &ViewResource) noexcept(false)
+        : ViewBase(pDevice,
+            &ViewResource,
+            CViewSubresourceSubset(Desc,
+                (UINT8)ViewResource.AppDesc()->MipLevels(),
+                (UINT16)ViewResource.AppDesc()->ArraySize(),
+                (UINT8)ViewResource.AppDesc()->NonOpaquePlaneCount() * ViewResource.SubresourceMultiplier())),
+        m_Desc(Desc),
+        m_BindRefs(0)
+    {
+    }
+
+    //----------------------------------------------------------------------------------------------------------------------------------
+    template<>
+    inline View<VideoProcessorOutputViewType>::~View() noexcept
+    {
     }
 
 };

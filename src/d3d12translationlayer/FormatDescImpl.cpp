@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-#include "FormatDesc.hpp"
+#include <pch.h>
 #include <intsafe.h>
-#include <assert.h>
 
 #define R D3D11FCN_R
 #define G D3D11FCN_G
@@ -744,6 +743,137 @@ HRESULT CD3D11FormatHelper::CalculateExtraPlanarRows(
     return S_OK;
 }
 
+//----------------------------------------------------------------------------
+// CalculateResourceSize
+HRESULT CD3D11FormatHelper::CalculateResourceSize(
+    UINT width, 
+    UINT height, 
+    UINT depth,
+    DXGI_FORMAT format, 
+    UINT mipLevels, 
+    UINT subresources, 
+    _Out_ SIZE_T& totalByteSize, 
+    _Out_writes_opt_(subresources) D3D11_MAPPED_SUBRESOURCE *pDst)
+{
+    UINT tableIndex = GetDetailTableIndexNoThrow( format );
+    const FORMAT_DETAIL& formatDetail = s_FormatDetail[tableIndex];
+
+    bool fIsBlockCompressedFormat = IsBlockCompressFormat(format );
+
+    // No format currently requires depth alignment.
+    assert(formatDetail.DepthAlignment == 1);
+
+    UINT subWidth = width;
+    UINT subHeight = height;
+    UINT subDepth = depth;
+    for (UINT s = 0, iM = 0, iA = 0; s < subresources; ++s)
+    {
+        UINT blockWidth;
+        if (FAILED(DivideAndRoundUp(subWidth, formatDetail.WidthAlignment, /*_Out_*/ blockWidth)))
+        {
+            return INTSAFE_E_ARITHMETIC_OVERFLOW;
+        }
+
+        UINT blockSize, blockHeight;
+        if (fIsBlockCompressedFormat)
+        {
+            if (FAILED(DivideAndRoundUp(subHeight, formatDetail.HeightAlignment, /*_Out_*/ blockHeight)))
+            {
+                return INTSAFE_E_ARITHMETIC_OVERFLOW;
+            }
+
+            // Block Compressed formats use BitsPerUnit as block size.
+            blockSize = formatDetail.BitsPerUnit;
+        }
+        else
+        {
+            // The height must *not* be aligned to HeightAlign.  As there is no plane pitch/stride, the expectation is that the 2nd plane
+            // begins immediately after the first.  The only formats with HeightAlignment other than 1 are planar or block compressed, and
+            // block compressed is handled above.
+            assert(formatDetail.bPlanar || formatDetail.HeightAlignment == 1);
+            blockHeight = subHeight;
+
+            // Combined with the division os subWidth by the width alignment above, this helps achieve rounding the stride up to an even multiple of
+            // block width.  This is especially important for formats like NV12 and P208 whose chroma plane is wider than the luma.
+            blockSize = formatDetail.BitsPerUnit * formatDetail.WidthAlignment;
+        }
+
+        if (DXGI_FORMAT_UNKNOWN == formatDetail.DXGIFormat)
+        {
+            blockSize = 8;
+        }
+
+        // Convert block width size to bytes.
+        assert((blockSize & 0x7) == 0);
+        blockSize = blockSize >> 3;
+
+        if (formatDetail.bPlanar)
+        {
+            if (FAILED(CalculateExtraPlanarRows(format, blockHeight, /*_Out_*/ blockHeight)))
+            {
+                return INTSAFE_E_ARITHMETIC_OVERFLOW;
+            }
+        }
+
+        // Calculate rowPitch, depthPitch, and total subresource size.
+        UINT rowPitch, depthPitch;
+        SIZE_T subresourceByteSize;
+        if (   FAILED(UIntMult(blockWidth, blockSize, &rowPitch))
+            || FAILED(UIntMult(blockHeight, rowPitch, &depthPitch))
+            || FAILED(SIZETMult(subDepth, depthPitch, &subresourceByteSize)))
+        {
+            return INTSAFE_E_ARITHMETIC_OVERFLOW;
+        }
+
+        if (pDst)
+        {
+            D3D11_MAPPED_SUBRESOURCE& dst = pDst[s];
+
+            // This data will be returned straight from the API to satisfy Map. So, strides/ alignment must be API-correct.
+            dst.pData = reinterpret_cast<void*>(totalByteSize);
+            assert(s != 0 || dst.pData == NULL);
+
+            dst.RowPitch = rowPitch; 
+            dst.DepthPitch = depthPitch;
+        }
+
+        // Align the subresource size.
+        static_assert((MAP_ALIGN_REQUIREMENT & (MAP_ALIGN_REQUIREMENT - 1)) == 0, "This code expects MAP_ALIGN_REQUIREMENT to be a power of 2.");
+        
+        SIZE_T subresourceByteSizeAligned;
+        if (FAILED(SIZETAdd(subresourceByteSize, MAP_ALIGN_REQUIREMENT - 1, &subresourceByteSizeAligned)))
+        {
+            return INTSAFE_E_ARITHMETIC_OVERFLOW;
+        }
+
+        subresourceByteSizeAligned = subresourceByteSizeAligned & ~(MAP_ALIGN_REQUIREMENT - 1);
+
+        if (FAILED(SIZETAdd(totalByteSize, subresourceByteSizeAligned, &totalByteSize)))
+        {
+            return INTSAFE_E_ARITHMETIC_OVERFLOW;
+        }
+
+        // Iterate over mip levels and array elements
+        if (++iM >= mipLevels)
+        {
+            ++iA;
+            iM = 0;
+
+            subWidth = width;
+            subHeight = height;
+            subDepth = depth;
+        }
+        else
+        {
+            subWidth /= (1 == subWidth ? 1 : 2);
+            subHeight /= (1 == subHeight ? 1 : 2);
+            subDepth /= (1 == subDepth ? 1 : 2);
+        }
+    }
+
+    return S_OK;
+}
+
 inline bool IsPow2( UINT Val )
 {
     return 0 == (Val & (Val - 1));
@@ -1108,6 +1238,162 @@ UINT CD3D11FormatHelper::NonOpaquePlaneCount(DXGI_FORMAT Format)
 
     // V208 and V408 are the only 3-plane formats. 
     return (Format == DXGI_FORMAT_V208 || Format == DXGI_FORMAT_V408) ? 3 : 2;
+}
+
+//---------------------------------------------------------------------------------------------------------------------------------
+// GetTileShape
+//
+// Retrieve Tiled Resource tile shape
+void CD3D11FormatHelper::GetTileShape(
+    D3D11_TILE_SHAPE* pTileShape, 
+    DXGI_FORMAT Format, 
+    D3D11_RESOURCE_DIMENSION Dimension, 
+    UINT SampleCount
+)
+{
+    UINT BPU = GetBitsPerUnit(Format);
+    switch(Dimension)
+    {
+    case D3D11_RESOURCE_DIMENSION_BUFFER:
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+        {
+            pTileShape->WidthInTexels = (BPU == 0) ? D3D11_2_TILED_RESOURCE_TILE_SIZE_IN_BYTES : D3D11_2_TILED_RESOURCE_TILE_SIZE_IN_BYTES*8 / BPU;
+            pTileShape->HeightInTexels = 1;
+            pTileShape->DepthInTexels = 1;
+        }
+        break;
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+        {
+            if (IsBlockCompressFormat(Format))
+            {
+                // Currently only supported block sizes are 64 and 128.
+                // These equations calculate the size in texels for a tile. It relies on the fact that 64 * 64 blocks fit in a tile if the block size is 128 bits.
+                assert(BPU == 64 || BPU == 128);
+                pTileShape->WidthInTexels = 64 * GetWidthAlignment(Format);
+                pTileShape->HeightInTexels = 64 * GetHeightAlignment(Format);
+                pTileShape->DepthInTexels = 1;
+                if (BPU == 64)
+                {
+                    // If bits per block are 64 we double width so it takes up the full tile size.
+                    assert((Format >= DXGI_FORMAT_BC1_TYPELESS && Format <= DXGI_FORMAT_BC1_UNORM_SRGB) ||
+                           (Format >= DXGI_FORMAT_BC4_TYPELESS && Format <= DXGI_FORMAT_BC4_SNORM));
+                    pTileShape->WidthInTexels *= 2;
+                }
+            }
+            else
+            {
+                // Not a block format so BPU is bits per pixel.
+                pTileShape->DepthInTexels = 1;
+                switch(BPU)
+                {
+                case 8:
+                    pTileShape->WidthInTexels = 256;
+                    pTileShape->HeightInTexels = 256;
+                    break;
+                case 16:
+                    pTileShape->WidthInTexels = 256;
+                    pTileShape->HeightInTexels = 128;
+                    break;
+                case 32:
+                    pTileShape->WidthInTexels = 128;
+                    pTileShape->HeightInTexels = 128;
+                    break;
+                case 64:
+                    pTileShape->WidthInTexels = 128;
+                    pTileShape->HeightInTexels = 64;
+                    break;
+                case 128:
+                    pTileShape->WidthInTexels = 64;
+                    pTileShape->HeightInTexels = 64;
+                    break;
+                }
+                switch(SampleCount)
+                {
+                case 1:
+                    break;
+                case 2:
+                    pTileShape->WidthInTexels /= 2;
+                    pTileShape->HeightInTexels /= 1;
+                    break;
+                case 4:
+                    pTileShape->WidthInTexels /= 2;
+                    pTileShape->HeightInTexels /= 2;
+                    break;
+                case 8:
+                    pTileShape->WidthInTexels /= 4;
+                    pTileShape->HeightInTexels /= 2;
+                    break;
+                case 16:
+                    pTileShape->WidthInTexels /= 4;
+                    pTileShape->HeightInTexels /= 4;
+                    break;
+                default:
+                    ASSUME(false);
+                }
+            }
+        break;
+        }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+        {
+            if (IsBlockCompressFormat(Format))
+            {
+                // Currently only supported block sizes are 64 and 128.
+                // These equations calculate the size in texels for a tile. It relies on the fact that 16*16*16 blocks fit in a tile if the block size is 128 bits.
+                assert(BPU == 64 || BPU == 128);
+                pTileShape->WidthInTexels = 16 * GetWidthAlignment(Format);
+                pTileShape->HeightInTexels = 16 * GetHeightAlignment(Format);
+                pTileShape->DepthInTexels = 16 * GetDepthAlignment(Format);
+                if (BPU == 64)
+                {
+                    // If bits per block are 64 we double width so it takes up the full tile size.
+                    assert((Format >= DXGI_FORMAT_BC1_TYPELESS && Format <= DXGI_FORMAT_BC1_UNORM_SRGB) ||
+                           (Format >= DXGI_FORMAT_BC4_TYPELESS && Format <= DXGI_FORMAT_BC4_SNORM));
+                    pTileShape->WidthInTexels *= 2;
+                }
+            }
+            else if (Format == DXGI_FORMAT_R8G8_B8G8_UNORM || Format == DXGI_FORMAT_G8R8_G8B8_UNORM)
+            {
+                //RGBG and GRGB are treated as 2x1 block format
+                pTileShape->WidthInTexels = 64;
+                pTileShape->HeightInTexels = 32;
+                pTileShape->DepthInTexels = 16;
+            }
+            else
+            {
+                // Not a block format so BPU is bits per pixel.
+                assert(GetWidthAlignment(Format) == 1 && GetHeightAlignment(Format) == 1 && GetDepthAlignment(Format));
+                switch(BPU)
+                {
+                case 8:
+                    pTileShape->WidthInTexels = 64;
+                    pTileShape->HeightInTexels = 32;
+                    pTileShape->DepthInTexels = 32;
+                    break;
+                case 16:
+                    pTileShape->WidthInTexels = 32;
+                    pTileShape->HeightInTexels = 32;
+                    pTileShape->DepthInTexels = 32;
+                    break;
+                case 32:
+                    pTileShape->WidthInTexels = 32;
+                    pTileShape->HeightInTexels = 32;
+                    pTileShape->DepthInTexels = 16;
+                    break;
+                case 64:
+                    pTileShape->WidthInTexels = 32;
+                    pTileShape->HeightInTexels = 16;
+                    pTileShape->DepthInTexels = 16;
+                    break;
+                case 128:
+                    pTileShape->WidthInTexels = 16;
+                    pTileShape->HeightInTexels = 16;
+                    pTileShape->DepthInTexels = 16;
+                    break;
+                }
+            }
+            break;
+        }
+    }
 }
 
 
