@@ -12,7 +12,7 @@
 #include <sstream>
 #include <numeric>
 
-#include "ImmediateContext.inl"
+#include <D3D12TranslationLayerIncludes.h>
 
 #include "spookyv2.h"
 

@@ -15,6 +15,12 @@
 
 #include <directx/d3dx12.h>
 #include <directx/dxcore.h>
+#include <d3d11_3.h>
+#include <dxgi1_4.h>
+#include <comdef.h>
+#include <d3dkmthk.h>
+#include <d3d12video.h>
+#include <atlbase.h>
 
 #include <CL/OpenCL.h>
 #include <CL/cl.h>
@@ -24,6 +30,12 @@
 #include <CL/cl_dx9_media_sharing.h>
 #include <CL/cl_icd.h>
 
+#include <set>
+#include <functional>
+#include <mutex>
+#include <bitset>
+#include <optional>
+#include <queue>
 #include <type_traits>
 #include <memory>
 #include <vector>
@@ -42,7 +54,7 @@ using Microsoft::WRL::ComPtr;
 
 #define WIL_ENABLE_EXCEPTIONS
 #include <wil/result_macros.h>
-#include "XPlatHelpers.h"
+#include <D3D12TranslationLayerIncludes.h>
 
 #include <scheduler.hpp>
 

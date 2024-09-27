@@ -3,9 +3,9 @@
 #include "resources.hpp"
 #include "task.hpp"
 #include "queue.hpp"
-#include "wil/resource.h"
+#include <wil/resource.h>
 
-#include "ImmediateContext.inl"
+#include <D3D12TranslationLayerIncludes.h>
 
 template <typename T>
 using unique_comptr = D3D12TranslationLayer::unique_comptr<T>;

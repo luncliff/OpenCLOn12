@@ -19,7 +19,7 @@
 #endif
 #include <windows.h>
 
-#include <XPlatHelpers.h>
+#include <D3D12TranslationLayerIncludes.h>
 
 namespace BackgroundTaskScheduler
 {

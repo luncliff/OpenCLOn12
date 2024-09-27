@@ -7,7 +7,7 @@
 #include <wil/resource.h>
 #include <directx/d3d12compatibility.h>
 
-#include "ImmediateContext.inl"
+#include <D3D12TranslationLayerIncludes.h>
 
 extern CL_API_ENTRY cl_int CL_API_CALL
 clGetDeviceIDs(cl_platform_id   platform,

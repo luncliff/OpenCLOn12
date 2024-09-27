@@ -7,8 +7,7 @@
 #include <variant>
 #include <wil/resource.h>
 
-#include "FormatDesc.hpp"
-#include "ImmediateContext.inl"
+#include <D3D12TranslationLayerIncludes.h>
 
 using D3D12TranslationLayer::ImmediateContext;
 using UpdateSubresourcesFlags = ImmediateContext::UpdateSubresourcesFlags;

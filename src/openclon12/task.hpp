@@ -6,7 +6,7 @@
 #include <mutex>
 #include <future>
 
-#include "Query.hpp"
+#include <D3D12TranslationLayerIncludes.h>
 
 // A task is an encapsulation of something that can be submitted to a command queue
 // and/or something that can be waited on (i.e. cl_event).
